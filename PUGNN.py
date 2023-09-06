@@ -679,7 +679,6 @@ class PUGNNTrainer(object):
         
         plotly.io.write_html(fig,  os.path.join(self._plots_directory, 'Training Summary.html'))
         plotly.io.write_json(fig,  os.path.join(self._plots_directory, 'Training Summary.json'))
-        plotly.io.write_image(fig,  os.path.join(self._plots_directory, 'Training Summary.png'))
         
         summary = namedtuple('TrainingSummary', ['failing_status', 'training_set_loss', 'validation_set_loss', 'plot'])        
         
@@ -917,7 +916,7 @@ class PUGNNSummary():
         self._range = np.arange(self._y.min(), self._y.max() + 2)
         
     def distribution_plots(self):
-        s = namedtuple("DistPlots", ["hitmap", "histogram", 'kdeplot'])
+        s = namedtuple("DistPlots", ["heatmap", "histogram", 'kdeplot'])
         
         # histogram
         fig_hist = go.Figure()
@@ -1001,11 +1000,6 @@ class PUGNNSummary():
         plotly.io.write_json(fig_kde,   os.path.join(self._output_dir, 'dp-kdeplot.json'))
         plotly.io.write_json(fig_hm,    os.path.join(self._output_dir, 'dp-heatmap.json'))
         
-        
-        plotly.io.write_image(fig_hist,  os.path.join(self._output_dir, 'dp-histogram.png'))
-        plotly.io.write_image(fig_kde,   os.path.join(self._output_dir, 'dp-kdeplot.png'))
-        plotly.io.write_image(fig_hm,    os.path.join(self._output_dir, 'dp-heatmap.png'))
-        
         return s(fig_hm, fig_hist, fig_kde)
     
     def residual_plot(self):
@@ -1016,7 +1010,6 @@ class PUGNNSummary():
         fig.update_layout(title="Residual Plot")
         plotly.io.write_html(fig,  os.path.join(self._output_dir, 'residual-plot.html'))
         plotly.io.write_json(fig,  os.path.join(self._output_dir, 'residual-plot.json'))
-        plotly.io.write_image(fig,  os.path.join(self._output_dir, 'residual-plot.png'))
         return fig
     
     def compare(self, **outputs):
@@ -1041,7 +1034,6 @@ class PUGNNSummary():
         
         plotly.io.write_html(fig,  os.path.join(self._output_dir, 'compare-models-plot.html'))
         plotly.io.write_json(fig,  os.path.join(self._output_dir, 'compare-models-plot.json'))
-        plotly.io.write_image(fig,  os.path.join(self._output_dir, 'compare-models-plot.png'))
         
         s = namedtuple('Comparing', ['plot', 'R2'])
         return s(fig, r_squared_array)
@@ -1115,7 +1107,6 @@ class PUGNNSummary():
         
         plotly.io.write_html(fig,  os.path.join(self._output_dir, 'model-reliabilty-poisson-dist.html'))
         plotly.io.write_json(fig,  os.path.join(self._output_dir, 'model-reliabilty-poisson-dist.json'))
-        plotly.io.write_png(fig,  os.path.join(self._output_dir, 'model-reliabilty-poisson-dist.png'))
 
         return s(fig, act_arr, mle_arr, left_err_arr, right_err_arr)
         
