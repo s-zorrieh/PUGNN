@@ -13,6 +13,9 @@ import datetime as dt
 import plotly.graph_objects as go
 import plotly.express as px
 from torch_geometric.loader import DataLoader
+import plotly
+
+from collections import namedtuple
 
 import os.path as osp
 import torch_geometric as pyg
@@ -37,26 +40,29 @@ def check_and_summarize(directory, to='./', rewrite=True, log=True):
     json_files = []
     summary = dict()
     
-    for file in os.listdir(directory):
-        is_hdf5_file, file_name = is_ext(file, 'h5')
+    with open(os.path.join(to, 'metadata.log'), "w") as logfile:
+        
+        for file in os.listdir(directory):
+            is_hdf5_file, file_name = is_ext(file, 'h5')
 
-        if is_hdf5_file:
-            try:
-                with h5py.File(directory + file) as f:
-                    pass
+            if is_hdf5_file:
+                try:
+                    with h5py.File(directory + file) as f:
+                        pass
 
-                with open(osp.join(directory, file_name + '.json'), "r") as j:
-                    d = json.load(j)
-                    nfiles += 1
-                    for pu in d:
-                        try:
-                            summary[pu][file_name] = d[pu][file_name]
-                        except KeyError:
-                            summary[pu] = d[pu]
-                            
-            except Exception as e:
-                if log:
-                    print(e, ':', file, file=sys.stderr)
+                    with open(osp.join(directory, file_name + '.json'), "r") as j:
+                        d = json.load(j)
+                        nfiles += 1
+                        for pu in d:
+                            try:
+                                summary[pu][file_name] = d[pu][file_name]
+                            except KeyError:
+                                summary[pu] = d[pu]
+
+                except Exception as e:
+                    print(file, ':', e, file=logfile)
+                    if log:
+                        print(file, ':', e, file=sys.stderr)
 
     # summary
     if rewrite:
@@ -78,8 +84,11 @@ def check_tensors(*tensors):
     return nnan > 0, ninf > 0 
 
 def check_data(data, b_ind=-1):
-    inf_status, nan_status = check_tensors(data.edge_attr, data.edge_index, data.x, data.nvertices, data.nparticles, data.y)
-    
+    if hasattr(data, 'adj_t'):
+        inf_status, nan_status = check_tensors(data.edge_attr, data.x, data.nvertices, data.nparticles, data.y)
+    else:
+        inf_status, nan_status = check_tensors(data.edge_attr, data.edge_index, data.x, data.nvertices, data.nparticles, data.y)
+        
     clean = not (inf_status or nan_status)
     err   = None
     
@@ -395,16 +404,20 @@ class GraphDataset(IndexingSystem, pyg.data.Dataset):
             raw_data = self.pre_transform(raw_data)
         
         data = self._data_reader(raw_data, self.log, filename, PU, infile_index)
-        
-        if self.transform is not None:
-            data = self.transform(data)
             
         # Checking the data is cleaned:
         if not check_data(data)[0]:
             s = f"The record {idx} at {filename}: {PU}: {infile_index} contains nan, even after cleaning.\nMaybe there is a bug or a serious problem in data."
             print(s, file=sys.stderr)
-
+            return data
+        
+        if self.transform is not None:
+            
+            data = self.transform(data)
+            
         return data
+
+        
     
     def file_dir(self) -> str:
         """
@@ -440,7 +453,7 @@ class GraphDataset(IndexingSystem, pyg.data.Dataset):
                              f"attribute 'num_edge_features'")
 
 
-class PUGNNModel(object):
+class PUGNNTrainer(object):
     def __init__(self, name, desc, model, dataset, root='./', device='auto', seed=42, disable_progress_bar=False):
         self._prog    = disable_progress_bar
         self._root    = root
@@ -449,9 +462,11 @@ class PUGNNModel(object):
         self._seed    = seed
         self._model   = model
         self._dataset = dataset
-        
-        self._main_directory = os.path.join(root, f'PU-{self._name}')
-        self._sub_directory  = str(dt.datetime.now(pytz.timezone('Asia/Tehran'))).split('.')[0].replace(' ', '@') + '--' +  self._desc
+        self._main_directory   = os.path.join(root, f'PU-{self._name}-Trainer')
+        self._sub_directory    = os.path.join(self._main_directory, 
+                                             str(dt.datetime.now(pytz.timezone('Asia/Tehran'))).split('.')[0].replace(' ', '@') + '--' +  self._desc)
+        self._plots_directory  = os.path.join(self._sub_directory, 'plots')
+        self._models_directory = os.path.join(self._sub_directory, 'models')
         
         self._train_gen      = None
         self._validation_gen = None
@@ -466,9 +481,8 @@ class PUGNNModel(object):
         self._lr_scheduler   = None
         
         self._batch_size = None
+        self._benchmarking = False
         
-        self._OUTPUST_SUM             = None
-        self._OUTPUTS_SUMNORMSQUARED  = None
         
         if isinstance(device, str):
             if device.lower() != 'auto':
@@ -484,15 +498,17 @@ class PUGNNModel(object):
         if not os.path.isdir(self._main_directory):
             os.mkdir(self._main_directory)
         
-        os.mkdir(os.path.join(self._main_directory, self._sub_directory))
+        os.mkdir(self._sub_directory)
         
         self._history = dict()
         ind = 0
         for entry in os.listdir(self._main_directory):
-            print(entry)
             if os.path.isdir(os.path.join(self._main_directory, entry)):
                 self._history[ind] = entry
                 ind += 1
+        os.mkdir(self._plots_directory)
+        os.mkdir(self._models_directory)
+        
         
     @property
     def history(self):
@@ -518,7 +534,7 @@ class PUGNNModel(object):
     def device(self):
         return self._device
     
-    def load_last_model(self, history_level=None, search=True):
+    def load_last_model(self, history_level=None, search=True, best=True):
         if history_level is None:
             history_level = len(self._history) - 1
             search = True
@@ -527,14 +543,21 @@ class PUGNNModel(object):
             print("The is no saved model", file=sys.stderr)
             return None
         
-        direc = os.path.join(self._main_directory, self._history[history_level])
+        direc = os.path.join(self._models_directory, self._history[history_level])
         models = list(filter(lambda name: is_ext(name, ext0='pt')[0], os.listdir(direc)))
         
         if len(models) == 0:
             if search:
                 return self.load_last_model(history_level=history_level - 1, search=True)
+            print(f"There's not any saved model at this level (={history_level}).", file=sys.stderr)
             
-            print(f"There's not any saved model at this level (={history_level}).")
+        if best:
+            for model in models:
+                if model[-4] == ')':
+                    return torch.load(os.path.join(direc, model))
+            print(f"There's not the best model at this level (={history_level}). Maybe the last training is intrrupted", file=sys.stderr)
+                
+            
         return torch.load(os.path.join(direc, models[-1]))
         
     def get_ready(self, test_set_per, validation_set_per, dataloader_params:dict):
@@ -552,11 +575,11 @@ class PUGNNModel(object):
         self._validation_gen = DataLoader(valid_subset, **dataloader_params)
         self._test_gen       = DataLoader(test_subset,  **dataloader_params)
     
-    def _train_one_epoch(self, epoch=-1, clip=None):
+    def train_one_epoch(self, epoch=-1, clip=None):
         self._model.train()        
         for data, b_ind in zip(self._train_gen, trange(len(self._train_gen) - 1, desc=f"Epoch {epoch+1:03d}", unit="Batch", disable=self._prog)):
             
-            clean, err = check_data(data, b_ind)
+            clean, err = self.check_data(data, b_ind)
             if not clean:
                 print(err, file=sys.stderr)
                 continue
@@ -576,21 +599,22 @@ class PUGNNModel(object):
 
             self._optimizer.step()  # Update parameters based on gradients.
             self._optimizer.zero_grad()  # Clear gradients.
-            del data 
+#             del data 
 
         return 0, None
 
+    def check_data(self, data, b_ind):
+        return check_data(data, b_ind)
+    
     def train(self, max_epochs, optimizer, optimizer_args,
                                 loss_fn, loss_fn_args=dict(),
                                 lr_scheduler=None, lr_scheduler_args=dict(),
-                                grad_clipping_number=None, save_models=True, reset=True):
-
-        print("Training device {}...\n".format(self._device))
-        torch.backends.cudnn.benchmark = True
-        
-        if reset: 
-            reset_parameters(self._model)
+                                grad_clipping_number=None, save_models=True, reset=True, use_benchmark=True):
+        if reset:
+            self._model.reset_parameters()
             
+        print("Training device {}...\n".format(self._device))
+        
         self._model        = self._model.to(self._device)
         self._loss_func    = loss_fn(**loss_fn_args)
         self._optimizer    = optimizer(self._model.parameters(), **optimizer_args)
@@ -600,53 +624,80 @@ class PUGNNModel(object):
         valid_loss_arr = np.zeros(max_epochs)
         
         is_failed = False
-
+        
+        torch.backends.cudnn.benchmark = use_benchmark
+        
+        summary = namedtuple('TrainingSummary', ['failing_status', 'res'])
+        
         for epoch in trange(max_epochs, desc=f'Training the {self._name}...', unit='Epoch', ncols=950, disable=self._prog):
             torch.cuda.empty_cache()
-            
-            is_failed, res = self._train_one_epoch(epoch, grad_clipping_number)
+                        
+            is_failed, res = self.train_one_epoch(epoch, grad_clipping_number)
             if is_failed:
                 print(res[0], file=sys.stderr)
-                return is_failed, res
+                return summary(is_failed, res)
             
-            is_failed, res = self.evaluate("train")
+            is_failed, res = self.train_evaluate()
             if is_failed:
                 print(res[0], file=sys.stderr)
-                return is_failed, res
+                return summary(is_failed, res)
+            
             train_loss_arr[epoch] = res
             
-            is_failed, res = self.evaluate("validation")
+            is_failed, res = self.validation_evaluate()
             if is_failed:
                 print(res[0], file=sys.stderr)
-                return is_failed, res
+                return summary(is_failed, res)
+            
             valid_loss_arr[epoch] = res
             
             if save_models:
-                torch.save(self._model, f'{os.path.join(self._main_directory, self._sub_directory)}/model-epoch-{epoch:0{len(str(max_epochs))}d}.pt')
+                path_to_model = os.path.join(self._models_directory, f"epoch-{epoch + 1:0{len(str(max_epochs))}d}.pt")
+                torch.save(self._model, path_to_model)
                         
             print(f'Training Set Loss: {train_loss_arr[epoch]:.4f}, Validation Set Loss: {valid_loss_arr[epoch]:.4f}\n')
             
             if self._lr_scheduler is not None:
                 self._lr_scheduler.step()
+                
         
-        return is_failed, (train_loss_arr, valid_loss_arr)
+        if save_models:
+            best_model_ind = np.argmin(valid_loss_arr)
+            best_model_dir = os.path.join(self._models_directory, f"epoch-{best_model_ind + 1:0{len(str(max_epochs))}d}.pt")
+            best_model_new_dir = os.path.join(self._models_directory, f"epoch-{best_model_ind + 1:0{len(str(max_epochs))}d}(best).pt")
+            os.rename(best_model_dir, best_model_new_dir)
+
+        fig = go.Figure(
+                data = [
+                    go.Scatter(x=list(range(1, max_epochs + 1)), y=train_loss_arr, name='Training Set'),
+                    go.Scatter(x=list(range(1, max_epochs + 1)), y=valid_loss_arr, name='Validation Set'),
+                ]
+        )
+        fig.update_layout(title="Training Summary")
+        fig.update_xaxes(title="Epoch")
+        fig.update_yaxes(title=str(self._loss_func)[:-2])
         
-    def evaluate(self, eval_set:str):
-        assert eval_set.lower() in ['validation', 'train']
+        plotly.io.write_html(fig, filename=os.path.join(self._plots_directory, 'Training Summary.html'))
+        plotly.io.write_json(fig, filename=os.path.join(self._plots_directory, 'Training Summary.json'))
+        plotly.io.write_image(fig, filename=os.path.join(self._plots_directory, 'Training Summary.png'))
+        
+        summary = namedtuple('TrainingSummary', ['failing_status', 'training_set_loss', 'validation_set_loss', 'plot'])        
+        
+        return summary(is_failed, train_loss_arr, valid_loss_arr, fig)
+        
+    def train_evaluate(self):
         self._model.eval()
-        is_training_set = eval_set.lower() == 'train'        
-        length   = len(self._train_gen) if is_training_set else len(self._validation_gen)
+        length   = len(self._train_gen)
         loss_arr  = torch.Tensor(length).zero_()
-        total = self._train_len if is_training_set else self._validation_len
+        total = self._train_len
         b_ind = 0
         
         failed = False
         
-         
         with torch.no_grad():
             # Iterate in batches over the training/test/validation dataset.
-            for data in (self._train_gen if is_training_set else self._validation_gen):
-                clean, err = check_data(data, b_ind)
+            for data in self._train_gen:
+                clean, err = self.check_data(data, b_ind)
                 if not clean:
                     print(err, file=sys.stderr)
                     b_ind += 1
@@ -656,13 +707,77 @@ class PUGNNModel(object):
                 out = self._model(data)  
 
                 if out.cpu().detach().isnan().sum() > 0:
-                    w = f"nan loss detected during evaluation of {'training set' if is_training_set else 'validation set'}. Perhaps there is a problem..."
+                    w = f"nan loss detected during evaluation of 'training set'. Perhaps there is a problem..."
                     failed = True
                     return failed, (w, data)
 
                 loss_arr[b_ind] += self._loss_func(out, data.y.unsqueeze(1)).cpu().item() * len(data) / total
                 b_ind += 1
-                del data
+#                 del data
+        
+        return failed, loss_arr.sum()
+    
+    def test_evaluate(self):
+        self._model.eval()
+        length   = len(self._test_gen)
+        loss_arr  = torch.Tensor(length).zero_()
+        total = self._test_len
+        b_ind = 0
+        
+        failed = False
+        
+        with torch.no_grad():
+            # Iterate in batches over the training/test/validation dataset.
+            for data in self._test_gen:
+                clean, err = self.check_data(data, b_ind)
+                if not clean:
+                    print(err, file=sys.stderr)
+                    b_ind += 1
+                    continue
+
+                data = data.to(self._device)
+                out = self._model(data)  
+
+                if out.cpu().detach().isnan().sum() > 0:
+                    w = "nan loss detected during evaluation of 'test set'. Perhaps there is a problem..."
+                    failed = True
+                    return failed, (w, data)
+
+                loss_arr[b_ind] += self._loss_func(out, data.y.unsqueeze(1)).cpu().item() * len(data) / total
+                b_ind += 1
+#                 del data
+        
+        return failed, loss_arr.sum()
+    
+    def validation_evaluate(self):
+        self._model.eval()
+        length   = len(self._validation_gen)
+        loss_arr  = torch.Tensor(length).zero_()
+        total = self._validation_len
+        b_ind = 0
+        
+        failed = False
+        
+        with torch.no_grad():
+            # Iterate in batches over the training/test/validation dataset.
+            for data in self._validation_gen:
+                clean, err = self.check_data(data, b_ind)
+                if not clean:
+                    print(err, file=sys.stderr)
+                    b_ind += 1
+                    continue
+
+                data = data.to(self._device)
+                out = self._model(data)  
+
+                if out.cpu().detach().isnan().sum() > 0:
+                    w = "nan loss detected during evaluation of 'validation set'. Perhaps there is a problem..."
+                    failed = True
+                    return failed, (w, data)
+
+                loss_arr[b_ind] += self._loss_func(out, data.y.unsqueeze(1)).cpu().item() * len(data) / total
+                b_ind += 1
+#                 del data
         
         return failed, loss_arr.sum()
     
@@ -672,13 +787,61 @@ class PUGNNModel(object):
             if res is None:
                 print('PU Summary process for the last saved model was not successful. The current model is passed...')
             else:
-                return PUGNNSummary(self._test_gen, res, seed=self._seed)
+                return PUGNNSummary(self._test_gen, res, output=self._plots_directory, seed=self._seed)
             
-        return PUGNNSummary(self._test_gen, self._model, seed=self._seed)
+        return PUGNNSummary(self._test_gen, self._model, output=self._plots_directory, seed=self._seed)
 
+    
+class MultibatchPUGNNTrainer(PUGNNTrainer):
+    def __init__(self, num_batch=5, *args, **kwargs):
+        super(MultibatchPUGNNTrainer, self).__init__(*args, **kwargs)
+        self._n = num_batch
+        
+    def train_one_epoch(self, epoch=-1, clip=None):
+        self._model.train()  
+        b_ind = -1
+        data_list = []
+        last_ind = self._train_len - 1
+        
+        for data in tqdm(self._train_gen, desc=f"Epoch {epoch+1:03d}", unit="Batch", disable=self._prog):
+            b_ind += 1
+            is_last = b_ind == last_ind
+            
+            clean, err = self.check_data(data, b_ind)
+            
+            if not clean:
+                print(err, file=sys.stderr)
+                continue
+                
+            if (b_ind % self._n == self._n - 1) or is_last:
+                data_list.append(data)
+                out    = self._model(data_list)    # Perform a single forward pass.
+                target = torch.cat([d.y for d in data_list])
+                loss   = self._loss_func(out, target.unsqueeze(1))                           # Compute the loss.
+
+                if np.isnan(loss.item()):
+                    w = "nan loss detected. Perhaps there is a divergance. Stopping the training..."
+                    return 1, (w, data)
+                
+                loss.backward()  # Derive gradients.
+                if clip is not None:
+                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), clip)
+                self._optimizer.step()       # Update parameters based on gradients.
+                self._optimizer.zero_grad()  # Clear gradients.
+                
+                del data_list
+                data_list = []
+            
+            else:
+                data_list.append(data)
+            
+        return 0, None
+    
         
 class PUGNNSummary():
-    def __init__(self, loader, model, device='auto', seed=42):
+    def __init__(self, loader, model, output, device='auto', seed=42):
+        self._output_dir = output
+        
         self._seed   = seed
         self._loader = loader
         self._model  = model
@@ -708,7 +871,10 @@ class PUGNNSummary():
         print(f"Data loader with length {len(self._loader)} is set.")
         print()
         print("====================== Successful ======================")
-    
+        
+        print("processing...")
+        self._process()
+        
     @property
     def yhat(self):
         return self._yhat
@@ -717,7 +883,7 @@ class PUGNNSummary():
     def y(self):
         return self._y
         
-    def process(self):
+    def _process(self):
         self._model = self._model.to(self._device)
         self._model.eval()
         
@@ -743,20 +909,104 @@ class PUGNNSummary():
 
                 b_ind += 1
 
-                del data
+#                 del data
         
         self._yhat = self._yhat.squeeze().detach().numpy()
         self._y    = self._y.detach().numpy()
         
         self._range = np.arange(self._y.min(), self._y.max() + 2)
         
-    def histogram(self):
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(x=self._y, name='PU'))
-        fig.add_trace(go.Histogram(x=self._yhat, name='Estimated PU'))
-        fig.update_xaxes("PU")
-        fig.update_yaxes("Count")
-        return fig
+    def distribution_plots(self):
+        s = namedtuple("DistPlots", ["hitmap", "histogram", 'kdeplot'])
+        
+        # histogram
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(x=self._y, name='PU'))
+        fig_hist.add_trace(go.Histogram(x=self._yhat, name='Estimated PU'))
+        fig_hist.update_xaxes(title="PU")
+        fig_hist.update_yaxes(title="Count")
+        fig_hist.update_layout(title="Histogram of PU and estimated PU")
+        
+        # kde
+        
+        fig_kde = go.Figure()
+        fig_kde.add_trace(go.Histogram2dContour(
+                x = self._y,
+                y = self._yhat,
+                colorscale = 'plasma',
+                reversescale = False,
+                xaxis = 'x',
+                yaxis = 'y'
+            ))
+
+        fig_kde.add_trace(go.Histogram(
+                y = self._yhat,
+                xaxis = 'x2',
+                marker = dict(
+                    color = 'rgba(0,0,100,1)'
+                )
+            ))
+        fig_kde.add_trace(go.Histogram(
+                x = self._y,
+                yaxis = 'y2',
+                marker = dict(
+                    color = 'rgba(0,0,100,1)'
+                )
+            ))
+
+        fig_kde.update_layout(
+            autosize = False,
+            xaxis = dict(
+                zeroline = False,
+                domain = [0,0.7],
+            ),
+            yaxis = dict(
+                zeroline = False,
+                domain = [0,0.7],
+            ),
+            xaxis2 = dict(
+                zeroline = False,
+                domain = [0.7,1],
+            ),
+            yaxis2 = dict(
+                zeroline = False,
+                domain = [0.7,1],
+            ),
+            height = 800,
+            width = 800,
+            bargap = 0,
+            hovermode = 'closest',
+            showlegend = False
+        )
+        
+        
+        fig_kde.update_xaxes(title="PU")
+        fig_kde.update_yaxes(title="Estimated PU")
+        fig_kde.update_layout(title="KDE Plot of PU and Estimated PU")
+        
+        # heatmap
+        
+        fig_hm = go.Figure(go.Histogram2d(x=self._y, y=self._yhat))
+        fig_hm.update_xaxes(title="PU")
+        fig_hm.update_yaxes(title="Estimated PU")
+        fig_hm.update_layout(title="2D histogrma of PU and Estimated PU")
+        
+        
+        
+        plotly.io.write_html(fig_hist, filename=os.path.join(self._output_dir, 'dp-histogram.html'))
+        plotly.io.write_html(fig_kde,  filename=os.path.join(self._output_dir, 'dp-kdeplot.html'))
+        plotly.io.write_html(fig_hm,   filename=os.path.join(self._output_dir, 'dp-heatmap.html'))
+        
+        plotly.io.write_json(fig_hist, filename=os.path.join(self._output_dir, 'dp-histogram.json'))
+        plotly.io.write_json(fig_kde,  filename=os.path.join(self._output_dir, 'dp-kdeplot.json'))
+        plotly.io.write_json(fig_hm,   filename=os.path.join(self._output_dir, 'dp-heatmap.json'))
+        
+        
+        plotly.io.write_image(fig_hist, filename=os.path.join(self._output_dir, 'dp-histogram.png'))
+        plotly.io.write_image(fig_kde,  filename=os.path.join(self._output_dir, 'dp-kdeplot.png'))
+        plotly.io.write_image(fig_hm,   filename=os.path.join(self._output_dir, 'dp-heatmap.png'))
+        
+        return s(fig_hm, fig_hist, fig_kde)
     
     def residual_plot(self):
         residuals = self._yhat - self._y
@@ -764,6 +1014,9 @@ class PUGNNSummary():
         fig.update_yaxes(title='Residuals')
         fig.update_xaxes(title='Estimated PU')
         fig.update_layout(title="Residual Plot")
+        plotly.io.write_html(fig, filename=os.path.join(self._output_dir, 'residual-plot.html'))
+        plotly.io.write_json(fig, filename=os.path.join(self._output_dir, 'residual-plot.json'))
+        plotly.io.write_image(fig, filename=os.path.join(self._output_dir, 'residual-plot.png'))
         return fig
     
     def compare(self, **outputs):
@@ -777,15 +1030,21 @@ class PUGNNSummary():
         
         for i, output_name in enumerate(outputs):
             y, yhat = outputs[output_name]
-            fig.add_trace(go.Scatter(x=y, y=yhat, name=output_name))
+            fig.add_trace(go.Scatter(x=y, y=yhat, name=output_name, mode='markers'))
             RSS_p = (yhat - self._yhat)**2
             r_squared_array[i + 1] = 1 - RSS.sum() / RSS_p.sum()
         
-        fig.add_trace(go.Scatter(x=self._y, y=self._yhat, name='The Model'))
+        fig.add_trace(go.Scatter(x=self._y, y=self._yhat, name='The Model', mode='markers'))
         fig.add_trace(go.Scatter(x=self._range, y=self._range, name='Actual Trend'))
         fig.update_xaxes(title='No. PU')
+        fig.update_layout(title='Comparing')
         
-        return fig, r_squared_array
+        plotly.io.write_html(fig, filename=os.path.join(self._output_dir, 'compare-models-plot.html'))
+        plotly.io.write_json(fig, filename=os.path.join(self._output_dir, 'compare-models-plot.json'))
+        plotly.io.write_image(fig, filename=os.path.join(self._output_dir, 'compare-models-plot.png'))
+        
+        s = namedtuple('Comparing', ['plot', 'R2'])
+        return s(fig, r_squared_array)
     
     def _poisson_dist_extraction(self, av, f=0.6):
         prv = poisson(av)
@@ -804,7 +1063,7 @@ class PUGNNSummary():
                 pu_counter[y] -= 1
         
         if sum(list(pu_counter.values())) > 1:
-            w = f"Change factor variable `f` (current value is `{f}`) based on the following:"
+            w = f"Change factor variable `fraction` (current value is `{f}`) based on the following:"
             print(w, file=sys.stderr)
             for pu in pu_counter:
                 if pu_counter[pu] > 0:
@@ -819,7 +1078,7 @@ class PUGNNSummary():
         
         return max_log_likelihood(xhat, llikelihood_pois, av_pu), x.mean()
     
-    def rangeLLE(self, starting_pu, ending_pu, f):
+    def rangeLLE(self, starting_pu, ending_pu, fraction=0.6):
         av_PUs = np.array([*range(starting_pu, ending_pu + 1)])
 
         mle_arr       = np.zeros(len(av_PUs))
@@ -828,7 +1087,7 @@ class PUGNNSummary():
         right_err_arr = np.zeros_like(mle_arr)
 
         for ind, pu in enumerate(tqdm(av_PUs, desc='Range-Based LLE',  unit='PU', ncols=950)):
-            temp, act = self.LLEstimation(pu)
+            temp, act = self.LLEstimation(pu, fraction)
             le, mle, re = temp
             
             mle_arr[ind]       = mle
@@ -848,8 +1107,17 @@ class PUGNNSummary():
                 )
         
         fig.add_trace(go.Scatter(x=av_PUs, y=av_PUs, name='Expected'))
+        fig.update_xaxes(title='$<PU>$')
+        fig.update_layout(title='Model Reliabilty for Poisson Distribution')
+
+        s = namedtuple('LogLikelihood_PU_Estimation',
+                       ['plot', 'true_pu', 'estimated_pu', 'lower_bond_error', 'upper_bond_error'])
         
-        return fig, left_err_arr, mle_arr, right_err_arr, act_arr
+        plotly.io.write_html(fig, filename=os.path.join(self._output_dir, 'model-reliabilty-poisson-dist.html'))
+        plotly.io.write_json(fig, filename=os.path.join(self._output_dir, 'model-reliabilty-poisson-dist.json'))
+        plotly.io.write_png(fig, filename=os.path.join(self._output_dir, 'model-reliabilty-poisson-dist.png'))
+
+        return s(fig, act_arr, mle_arr, left_err_arr, right_err_arr)
         
         
 class PUGNN(object):
@@ -857,14 +1125,23 @@ class PUGNN(object):
         assert from_pu < to_pu
         assert isinstance(freq, int) and freq > (to_pu - from_pu)
         
+        self._main_dir     = os.path.join(out_dir, f'{name}-PUGNN')
+        self._metadata_dir = os.path.join(self._main_dir, 'metadata')
+        
+        if not os.path.isdir(self._main_dir):
+            os.mkdir(self._main_dir)
+        
+        if not os.path.isdir(self._metadata_dir):
+            os.mkdir(self._metadata_dir)
+        
         print('Checking the input directoy and making the summary metadata...', file=sys.stderr)
-        nfiles = check_and_summarize(in_dir, out_dir)
+        nfiles = check_and_summarize(in_dir, self._metadata_dir)
         print(f'{nfiles} files found.', file=sys.stderr)
+        
         if nfiles == 0:
             print("The input directory doesn't have any compatible files. Please change the directory and re-initialize '{self._name}' by calling it." , file=sys.stderr)
         
         self._in     = in_dir
-        self._out    = out_dir
         self._name   = name
         self._dpb    = disable_progress_bar
         self._model  = None
@@ -884,7 +1161,7 @@ class PUGNN(object):
         try:
             self._dataset = GraphDataset(
                                 root=self._in, 
-                                metadata_dir=os.path.join(self._out,"summary.json"),
+                                metadata_dir=os.path.join(self._metadata_dir,"summary.json"),
                                 sample_metadata=self._collec, 
                                 seed=self._seed,
                                 reader=self._reader,
@@ -903,56 +1180,59 @@ class PUGNN(object):
     def describe(self):
         print('*'*100)
         print('*'*100)
+        print()
         print('Dataset: ')
         print()
-        print(f'\t{self._dataset}:')
-        print(f"\t{'='*25}")
-        print(f'\tNumber of graphs: {len(self._dataset)}')
-        print(f'\tNumber of features: {self._dataset.num_features}')
-        print(f'\tNumber of classes: {self._dataset.num_classes}')
-
+        print(self._dataset)
+        print('='*25)
+        print(f'Number of graphs: {len(self._dataset)}')
+        print(f'Number of features: {self._dataset.num_features}')
+        print(f'Number of classes: {self._dataset.num_classes}')
         data = self._dataset[100]  # Get the first graph object.
-
         print()
-        print('\t', data)
-        print(f"\t{'='*92}")
-
+        print( data)
+        print('='*92)
         # Gather some statistics about the first graph.
-        print(f'\tNumber of nodes: {data.num_nodes}')
-        print(f'\tNumber of edges: {data.num_edges}')
-        print(f'\tAverage node degree: {data.num_edges / data.num_nodes:.2f}')
-        print(f'\tHas isolated nodes: {data.has_isolated_nodes()}')
-        print(f'\tHas self-loops: {data.has_self_loops()}')
-        print(f'\tIs undirected: {data.is_undirected()}')
+        print(f'Number of nodes: {data.num_nodes}')
+        print(f'Number of edges: {data.num_edges}')
+        print(f'Average node degree: {data.num_edges / data.num_nodes:.2f}')
+        print(f'Has isolated nodes: {data.has_isolated_nodes()}')
+        print(f'Has self-loops: {data.has_self_loops()}')
+        print(f'Is undirected: {data.is_undirected()}')
         print()
         print()
         print('*'*100)
         print()
         print("Model:")
         print()
-        print(f"{self._model}")
+        print(self._model)
         
         if self._model is not None:
             total_params = sum(p.numel() for p in self._model.parameters() if p.requires_grad)
             print("dof =", total_params)
-        
+        print()
         print('*'*100)
         print('*'*100)
     
     @property
     def model(self):
-        return model
+        return self._model
+    
+    @property
+    def dataset(self):
+        return self._dataset
     
     def set_model(self, model):
         self._model = model
         
-    def toPUGNNModel(self, sub_name, test_precentage, validation_percentage, data_loader_parameters):
+    def toTrainer(self, sub_name, test_precentage, validation_percentage,
+                  Trainer=PUGNNTrainer, Trainer_args=dict(), **data_loader_parameters):
         if self._model is None:
             return print("Please set the model first...", file=sys.stderr)
             
-        pgm = PUGNNModel(name=self._name, desc=sub_name, model=self._model, dataset=self._dataset, root=self._out, seed=self._seed,
-                         disable_progress_bar=self._dpb)
-        pgm.get_ready(test_precentage, validation_percentage, data_loader_parameters)
-        return pgm
+        pgt = Trainer(name=self._name, desc=sub_name, model=self._model, dataset=self._dataset, root=self._main_dir, seed=self._seed,
+                         disable_progress_bar=self._dpb, **Trainer_args)
+        pgt.get_ready(test_precentage, validation_percentage, data_loader_parameters)
+        return pgt
         
         
