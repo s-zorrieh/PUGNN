@@ -238,7 +238,7 @@ def to_heterodata(raw_data, log=False, *args):
     ], dim=1)
     
     hdata = pyg.data.HeteroData({
-        'features': features, 'y': torch.from_numpy(gl).unsqueeze(1),
+        'features': features, 'y': torch.from_numpy(gl),
         'particle': {
             'x': x },
         ('particle', 'r_con', 'particle'):
@@ -285,7 +285,7 @@ def to_data(raw_data, log=False, *args):
     return pyg.data.Data(
         features=features, x=x,
         adj_t=adj,
-        y=torch.from_numpy(gl).unsqueeze(1)
+        y=torch.from_numpy(gl)
 )
 
 class IndexingSystem(object):
