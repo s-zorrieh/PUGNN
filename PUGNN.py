@@ -85,7 +85,7 @@ def check_tensors(*tensors):
 
 def check_data(data, b_ind=-1):
     if hasattr(data, 'adj_t'):
-        inf_status, nan_status = check_tensors(data.edge_attr, data.x, data.nvertices, data.nparticles, data.y)
+        inf_status, nan_status = check_tensors(data.x, data.nvertices, data.nparticles, data.y)
     else:
         inf_status, nan_status = check_tensors(data.edge_attr, data.edge_index, data.x, data.nvertices, data.nparticles, data.y)
         
@@ -142,7 +142,6 @@ def R_squared(y, yhat, y_prime=None):
     
     return 1 - RSS/RSS_prime
 
-
 def remove_nan_node(node_features, edge_index, edge_attributes):    
     node_ID, feature_ID = np.where(np.isnan(node_features))
     node_features       = np.delete(node_features, node_ID, axis=0)
@@ -165,7 +164,72 @@ def remove_inf_node(node_features, edge_index, edge_attributes):
         edge_attributes = np.delete(edge_attributes, edge, axis=0)
     
     return node_features, edge_index, edge_attributes
+
+def extend_features(x, nv):
+    graph_features = [nv]
+
+    for p_type in [11, 13, 22, 211, 130]:
+        mask = torch.abs(x[:, 5]) == p_type
+        x = torch.cat([
+            x, (mask).unsqueeze(1)
+        ], dim=1)
+        graph_features.append(mask.sum())
+
+    mask = torch.abs(x[:, 5]) < 2
+    graph_features.append(mask.sum())
+    x[:, 5] = (mask)
+
+    x = torch.cat([
+        x, (data.adj_t.to_torch_sparse_coo_tensor() @ x[:,1]).unsqueeze(1)
+    ])
+
+    graph_features = torch.tensor(graph_features).unsqueeze(1)
+    return x, graph_features
+
+def momentum_connection(pt, tr=0.3):
+    pt_t = torch.abs(pt.unsqueeze(1) - pt.unsqueeze(0))
+    mask = pt_t < tr
+    edge_inds  = mask.nonzero().t()
+    edge_attr = torch.pow(torch.sigmoid(pt_t[mask]), -1)
+    return edge_inds, edge_attr
+
+def to_heterodata(raw_data, log=False, *args):
+    node_features = np.array(raw_data["node_features"], dtype=np.float32)
+    geometric_ea  = np.array(raw_data["edge_attributes"], dtype=np.float32)
+    geometric_ei  = np.array(raw_data["edge_indecies"], dtype=np.int64)
+    gf = np.array(raw_data["graph_features"], dtype=np.float32)
+    gl = np.array(raw_data["graph_labels"], dtype=np.float32)
     
+    
+    if np.isnan(nf).sum() > 0:
+        node_features, geometric_ei, geometric_ea = remove_nan_node(node_features=node_features, edge_index=geometric_ei, edge_attributes=geometric_ea)
+        if log:
+            print("'{}' : 'PU={}' : 'E{}' : nan".format(*args), file=sys.stderr)
+            
+    if np.isinf(nf).sum() > 0:
+        node_features, geometric_ei, geometric_ea = remove_inf_node(node_features=node_features, edge_index=geometric_ei, edge_attributes=geometric_ea)
+        if log:
+            print("'{}' : 'PU={}' : 'E{}' : inf".format(*args), file=sys.stderr)
+    
+    x, features = extend_features(torch.from_numpy(node_features), gf[0])
+    geometric_ei = torch.from_numpy(geometric_ei)
+    geometric_ea = torch.pow(torch.sigmoid(torch.from_numpy(geometric_ea)), -1)
+    momentum_ei, momentum_ea = momentum_connection(x[:,1])
+    
+    hdata = pyg.data.HeteroData({
+        'features': features, 
+        'particle': {
+            'x': x },
+        ('particle', 'pos_con', 'particle'):
+        { 'edge_index': geometric_ei ,
+          'edge_attrs': geometric_ea },
+        ('particle', 'mom_con', 'particle'):
+        { 'edge_index': momentum_ei ,
+          'edge_attrs': momentum_ea },
+    })
+    return hdata
+
+
 
 def to_data(raw_data, log=False, *args):
     nf = np.array(raw_data["node_features"], dtype=np.float32)
@@ -174,7 +238,6 @@ def to_data(raw_data, log=False, *args):
     gf = np.array(raw_data["graph_features"], dtype=np.float32)
     gl = np.array(raw_data["graph_labels"], dtype=np.float32)
     
-    edge_indecies, edge_weights = utils.to_undirected(torch.from_numpy(ei), torch.from_numpy(ea))
     
     if np.isnan(nf).sum() > 0:
         nf, ei, ea = remove_nan_node(node_features=nf, edge_index=ei, edge_attributes=ea)
@@ -185,14 +248,16 @@ def to_data(raw_data, log=False, *args):
         nf, ei, ea = remove_inf_node(node_features=nf, edge_index=ei, edge_attributes=ea)
         if log:
             print("'{}' : 'PU={}' : 'E{}' : inf".format(*args), file=sys.stderr)
-            
-    return pyg.data.Data(x         =torch.from_numpy(nf),
-                    edge_index     =edge_indecies,
-                    edge_attr      =edge_weights,
-                    nvertices      =torch.from_numpy(gf[0]),
-                    nparticles     =torch.tensor([len(nf)]).unsqueeze(1),
-                    y              =torch.from_numpy(gl)
-                 )
+    
+    x, features = extend_features(torch.from_numpy(node_features), gf[0])
+    edge_indecies, edge_weights
+    
+    return pyg.data.Data(
+        features=features, x=x,
+        edge_index=torch.from_numpy(ei)
+        edge_attrs=torch.from_numpy(ea),
+        y=torch.from_numpy(gl).unsqueeze(1)
+)
 
 class IndexingSystem(object):
     """
@@ -409,11 +474,6 @@ class GraphDataset(IndexingSystem, pyg.data.Dataset):
         if not check_data(data)[0]:
             s = f"The record {idx} at {filename}: {PU}: {infile_index} contains nan, even after cleaning.\nMaybe there is a bug or a serious problem in data."
             print(s, file=sys.stderr)
-            return data
-        
-        if self.transform is not None:
-            
-            data = self.transform(data)
             
         return data
 
@@ -1112,7 +1172,7 @@ class PUGNNSummary():
         
         
 class PUGNN(object):
-    def __init__(self, name, in_dir, out_dir, from_pu, to_pu, freq, data_reader_function=to_data, transform=None, pre_transform=None, pre_filter=None, log=False, seed=42, disable_progress_bar=False):
+    def __init__(self, name, in_dir, out_dir, from_pu, to_pu, freq, heterodata=False, transform=None, pre_transform=None, pre_filter=None, log=False, seed=42, disable_progress_bar=False):
         assert from_pu < to_pu
         assert isinstance(freq, int) and freq > (to_pu - from_pu)
         
@@ -1140,7 +1200,7 @@ class PUGNN(object):
         self._range  = range(from_pu, to_pu + 1)
         self._len    = freq * len(self._range)
         self._collec = dict(zip(map(str, list(self._range)), np.ones(len(self._range)) * freq ))
-        self._reader = data_reader_function
+        self._reader = to_heterodata if heterodata else to_data
         self._tr     = transform
         self._pre_tr = pre_transform
         self._pre_f  = pre_filter
