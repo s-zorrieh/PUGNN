@@ -239,11 +239,12 @@ class BaseDataset(object):
     
 
 class BaseDataloader(object):
-    def __init__(self, dataset, seed=42,
+    def __init__(self, dataset, seed=42, cache_dir=None,
             test_precentage=10, validation_precentage=10,
             batch_size=64, num_workers=4, shuffle=False, pin_memory=False, **kwargs
             ) -> None:
         self._seed = seed
+        self._root = cache_dir
         self._batch_size  = dataloader_args['batch_size']
         self._dataset     = dataset
         self.process(len(dataset), 10, 10, batch_size=64, num_workers=4, shuffle=False, pin_memory=False, **kwargs)
@@ -261,6 +262,12 @@ class BaseDataloader(object):
         self._validation_len = (dataset_length * test_percentage) // 100 
         self._test_len       = (dataset_length * validation_percentage) // 100
         self._train_len      = dataset_length - self._validation_len - self._test_len
+        self._len = {
+            'test': self.test_len, 
+            'validation': self.validation_len,
+            'train': self.train_len
+        }
+
         train_subset, valid_subset, test_subset = torch.utils.data.random_split(
                 self._dataset, lengths=[self._train_len, self._validation_len, self._test_len]
             )
@@ -272,12 +279,35 @@ class BaseDataloader(object):
 
     def __enter__(self, subset, device='cuda:0'):
         assert subset in ['test', 'train', 'validation'], f"{subset} is unknown. Use one of 'test', 'train', 'validation'."
+        self._open = True
         self._context_loader   = subset
         self._context_device   = device
         self._context_dir      = osp.join(self._root, subset)
         self._context_metadata = self._loader_metadata[subset]
         yield iter(self)
     
+    @property
+    def test_len(self):
+        return self._test_len
+
+    @property
+    def train_len(self):
+        return self._train_len
+
+    @property
+    def validation_len(self):
+        return self._validation_len
+
+    def total(self):
+        if self._open:
+            return self._len[self._context_loader]
+        return len(self._dataset)
+
+    def __len__(self):
+        if self._open:
+            return len(self._loader_metadata[self.self._context_loader])
+        raise AssertionError
+
     def __exit__(self):
         self._open = False
 
@@ -286,29 +316,33 @@ class BaseDataloader(object):
             raise RuntimeError("Iteration only availabele when you open the dataloader")
         raise NotImplementedError
 
-        
-
 
 class BaseTrainer(object):
-    def __init__(self, name, root, dataloader, model_class, seed=42, disable_progress_bar=False, device="cuda:0"):
-        self._prog    = disable_progress_bar
-        self._root    = root
-        self._name    = name
-        self._desc    = desc
+    def __init__(self, root, dataloader, seed=42):
+        self._prog    = None
+        self._device  = None
+        self._model   = None
+        self._root    = osp.join(root, 'trainer')
         self._seed    = seed
-        self._model   = model
-        self._dataset = dataset
-        self._device  = device
-        self._models_directory = os.path.join(self._root, 'models')
-        
         self._loader  = dataloader
-        
-        self._optimizer      = None
-        self._loss_func      = None
-        self._lr_scheduler   = None
-        self._buffer
+        self._optimizer    = None
+        self._loss_func    = None
+        self._lr_scheduler = None
+
+        self._models_dir   = os.path.join(self._root, 'models')
+        ind = 0
+        while osp.isdir(self._models_dir):
+            ind += 1
+            self._models_dir = os.path.join(self._root, f'models({ind})')
         os.mkdir(self._models_directory)
     
+    def __enter__(self, model, device='cuda:0', disable_progress_bar=False):
+        self._prog   = disable_progress_bar
+        self._moder  = model
+        self._device = device
+        self._prog   = disable_progress_bar
+        return self
+
     @property
     def dataloader(self):
         return self._loader
@@ -337,7 +371,7 @@ class BaseTrainer(object):
     def train(self, max_epochs, optimizer, optimizer_args,
                                 loss_fn, loss_fn_args=dict(),
                                 lr_scheduler=None, lr_scheduler_args=dict(),
-                                use_benchmark=True,metrics=[], select_topk=5, **kwargs):
+                                use_benchmark=True, metrics=[], select_topk=5, **kwargs):
             
         print("Training device {}...\n".format(self._device))
         self._model        = self._model.to(self._device)
@@ -403,7 +437,7 @@ class BaseTrainer(object):
         plotly.io.write_json(fig,  os.path.join(self._root, 'Training Summary.json'))
         
         summary = namedtuple('TrainingSummary', 
-            ['failing_status', 'training_set_loss', 'validation_set_loss', 'plot', 'topkmodels']
+            ['failing_status', 'training_set_loss', 'validation_set_loss', 'plot', 'models']
         )        
         
         return summary(is_failed, train_loss_arr, valid_loss_arr, fig, self._bestk_models(valid_loss_arr, select_topk))
@@ -456,21 +490,34 @@ class MultibatchPUGNNTrainer(PUGNNTrainer):
     
         
 class BaseAnalyzer(object):
-    def __init__(self, root, loader, models, metric, device='cuda:0', seed=42):
-        self._output_dir = root
-        self._metric = metric
+    def __init__(self, root, loader, seed=42):
         self._seed   = seed
         self._loader = loader
-        self._models = models
-        self._device = device
+        self._metric = None
+        self._models = None
+        self._device = None
         self._model  = None
         self._yhat   = None
         self._y      = None
         self._range  = None
-        
+        self._output_dir = osp.join(root, 'analyzer')
+
+        ind = 0
+        while osp.isdir(self._main_dir):
+            ind += 1
+            self._output_dir = osp.join(root, f'analyzer({ind})')
+        osp.mkdir(self._output_dir)
+
         print("processing...")
         self._process()
-        
+    
+    def __enter__(self, models, metric, device='cuda:0'):
+        self._metric = metric
+        self._models = models
+        self._device = device
+        return self
+
+
     @property
     def yhat(self):
         return self._yhat

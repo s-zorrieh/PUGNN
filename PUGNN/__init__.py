@@ -1,5 +1,5 @@
 from .base import BaseDataReader, BaseDataset, BaseDataloader, BaseTrainer, BaseAnalyzer
-from .utils.processing_tools import get_data, to_data
+from .utils.processing_tools import get_data, to_data, check_and_summarize
 import numpy as np
 import datetime 
 import sys
@@ -63,25 +63,11 @@ class DataLoader(BaseDataloader):
         yield iter(self._context_metadata[self._context_loader])
 
 class BoostedDataLoader(BaseDataloader):
-    def __init__(self, root, dataset, seed,
-            dataset_args=dict(test_precentage=10, validation_precentage=10),
-            dataloader_args=dict(batch_size=64, num_workers=4, shuffle=False, pin_memory=False),
-            resume=True
-            ) -> None:
-        self._root = root
-    
-        super().__init__(dataset, seed,
-            dataset_args=dict(test_precentage=10, validation_precentage=10),
-            dataloader_args=dict(batch_size=64, num_workers=4, shuffle=False, pin_memory=False)
-            )
-        
     def process(self, dataset_length, dataset_args, dataloader_args):
         super().process(dataset_length, dataset_args, dataloader_args)
-
         print('Initializing...', file=sys.stderr)
         for name in ['test', 'train', 'validation']:
             osp.mkdir(self._root, name)
-
         for subset, name in zip([self._test_gen, self._train_gen, self._validation_gen], ['test', 'train', 'validation']):
             zeros  = len(str(len(subset)))
             branch = osp.join(self._root, name)
@@ -89,18 +75,7 @@ class BoostedDataLoader(BaseDataloader):
                 path_to_data = osp.join(branch, f'batch_{ind:0{zeros}d}.pt')
                 torch.save(data, path_to_data)
             self._loader_metadata[name] = [f'batch_{ind:0{zeros}d}.pt'for ind in range(len(self._test_gen))]
-        
         print('done.', file=sys.stderr)
-
-    def __enter__(self, subset, device='cuda:0'):
-        assert subset in ['test', 'train', 'validation'], f"{subset} is unknown. Use one of 'test', 'train', 'validation'."
-        self._context_loader   = subset
-        self._context_device   = device
-        self._context_dir      = osp.join(self._root, subset)
-        self._context_metadata = self._loader_metadata[subset]
-    
-    def __exit__(self):
-        self._open = False
 
     def __iter__(self):
         if not self._open:
@@ -239,7 +214,7 @@ class SW(object):
         self._root = root
         self._name = name
         self._metadata_dir = osp.join(self._main_dir, 'metadata')
-        self._output_dir   = osp.join(self._main_dir, 'out')
+        self._output_dir   = osp.join(self._main_dir, f'out-{self._time}')
         self._cache_dir    = osp.join(self._main_dir, f'cache-{self._time}')    
         self._main_dir     = osp.join(root, f'{name}-pugnnsw')
         if not os.path.isdir(self._main_dir):
@@ -273,17 +248,15 @@ class SW(object):
         self._dataset = Dataset(root, sample_metadata, self._seed, data_reader, **kwargs)
 
     def set_loader(self, DataLoaderClass, **kwargs):
-        self._loader = DataLoaderClasss(self.dataset, self._seed, **kwargs)
+        self._loader = DataLoaderClasss(self.dataset, self._seed, self._cache_dir, **kwargs)
     
-    def __enter__(self, mode, **kwargs):
-        assert mode in ['trainer', 'analyzer'], "Unsupported mode"
-        return self._select(mode)(**kwargs)
+    @property
+    def trainer_scope(self):
+        return Trainer(self._output_dir, self.loader, self._seed)
 
-    def _select(self, mode):
-        if mode.lower() == 'trainer':
-            return Trainer
-        if mode.lower() == 'analyzer':
-            return Analyzer
+    @property
+    def analyzer_scope(self):
+        return Analyzer(self._output_dir, self.loader, self._seed)
 
     def __del__(self):
         shutil.rmtree(self._cache_dir)
