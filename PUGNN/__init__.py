@@ -1,13 +1,14 @@
-from base import BaseDataReader, BaseDataset, BaseDataloader, BaseTrainer, BaseAnalyzer
-from utils.processing_tools import get_data, to_data
+from .base import BaseDataReader, BaseDataset, BaseDataloader, BaseTrainer, BaseAnalyzer
+from .utils.processing_tools import get_data, to_data
 import numpy as np
 import datetime 
 import sys
 import os.path as osp
+import os
 import pytz
 import os
 import shutil
-from contextlib import contextmanager
+
 
 
 class HomoDataReader(BaseDataReader):
@@ -89,7 +90,7 @@ class BoostedDataLoader(BaseDataloader):
                 torch.save(data, path_to_data)
             self._loader_metadata[name] = [f'batch_{ind:0{zeros}d}.pt'for ind in range(len(self._test_gen))]
         
-        print('done.' file=sys.stderr)
+        print('done.', file=sys.stderr)
 
     def __enter__(self, subset, device='cuda:0'):
         assert subset in ['test', 'train', 'validation'], f"{subset} is unknown. Use one of 'test', 'train', 'validation'."
@@ -261,14 +262,14 @@ class SW(object):
         return self._main_dir
 
     @property 
-    def dataset(self);
-    return self._dataset
+    def dataset(self):
+        return self._dataset
 
     @property
     def loader(self):
         return self._loader
     
-    def set_dataset(self, Dataset, DataReader, sample_metadata, data_reader **kwargs) -> None:
+    def set_dataset(self, Dataset, DataReader, sample_metadata, data_reader, **kwargs) -> None:
         self._dataset = Dataset(root, sample_metadata, self._seed, data_reader, **kwargs)
 
     def set_loader(self, DataLoaderClass, **kwargs):

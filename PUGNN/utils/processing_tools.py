@@ -31,8 +31,22 @@ def to_heterodata(nodes:dict, edges:dict, weights:dict, features, labels):
     momentum_ei, momentum_ea = momentum_connection(x[:,1])
     n = len(x)
 
-    for node in nodes:
+    for node in nodes: # nodes: dict[str, numpy array]
         ...
+        ##### TOOOOOOOOO DOOOOOOOOOOOOOO!!!!!!!!!!!!!
+    
+    for node, edge in zip(nodes, edges):
+        edge_index  = edges[edge][0]
+        edge_weight = edges[edge][1]
+
+        adj = SparseTensor(
+            row=edge_index[0],
+            col=edge_index[1],
+            value=edge_weight, 
+            sparse_sizes=(n, n)
+        )
+        ...
+    
     mom_adj_t = SparseTensor(
         row=momentum_ei[0],
         col=momentum_ei[1],
