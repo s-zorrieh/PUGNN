@@ -1,11 +1,17 @@
-from .utils.preprocessing_tools import get_index, check_and_summarize
-from .utils.processing_tools import remove_inf_node, remove_nan_node
 import sys
 import numpy as np
 from numpy import random
-import torch
+from .utils.preprocessing_tools import get_index, check_and_summarize
+from .utils.processing_tools import remove_inf_node, remove_nan_node
 from torch_geometric.loader import DataLoader as pyg_dataloader
+import torch
+import plotly
+import plotly.express as px
+import plotly.graph_objects as go
 from copy import deepcopy
+from collections import namedtuple, OrderedDict
+from tqdm.notebook import trange, tqdm
+import os
 import os.path as osp
 import json
 
@@ -26,7 +32,7 @@ class BaseIndexingSystem(object):
     the database. Also, it allows us to do sampling over database.
     """
     
-    def __init__(self, collection, seed, **sampling_strategy):
+    def __init__(self, metadata, collection, seed, **sampling_strategy):
         self._seed                        = seed
         self._metadata                    = metadata    # Metadata
         self._metadata_summary            = dict()      # Metadata Summary
@@ -45,7 +51,7 @@ class BaseIndexingSystem(object):
             2. Dictionary for pu - #pu pair; i.e. DICT[PU] = #PU
         """
         files = set()
-        for PU in self._MD:
+        for PU in self._metadata:
             PU_metadata = self._metadata[PU]
             current_PU = 0
             for file_name in PU_metadata:
@@ -85,6 +91,7 @@ class BaseIndexingSystem(object):
         Random sampling of the whole data from sample metadata
         """
         random.seed(self._seed)
+        rejected_PU = self._data_collection_preprocessing(dc)
         for PU in self._sample_metadata:
             PU = str(int(PU))
             self._sample_metadata_information[PU] = random.choice(
@@ -100,7 +107,7 @@ class BaseIndexingSystem(object):
         It is mapped into a local index of a given PU associated with `ind`.
         """
         PU, ind = get_index(self._sample_metadata, ind)
-        real_index = self._sample_meatdata_information[PU][int(ind)]
+        real_index = self._sample_metadata_information[PU][int(ind)]
         return PU, real_index
     
     def _get_item(self, ind):
@@ -155,13 +162,13 @@ class BaseDataReader(object):
             return has_inf, remove_inf_node(node_features=nodes, edge_index=edges, edge_attributes=edge_attrs)
         return has_inf, None
 
-    def __call__(self, *args, **kwargs):
-        return get(*args, **kwargs)
-    
     def get(self, *args, **kwargs):
         raise NotImplementedError("This is a abstract class")
-        
 
+    def __call__(self, *args, **kwargs):
+        return self.get(*args, **kwargs)
+    
+        
 class BaseDataset(object):
     def __init__(self, root, in_dir, sample_metadata, reader, seed=42,
                  sampling_strategy={"replace":False, "p":None},
@@ -169,6 +176,7 @@ class BaseDataset(object):
         
         if isinstance(root, str):
             root = osp.expanduser(osp.normpath(root))
+        self._seed         = seed
         self._in_dir       = in_dir
         self.root          = root
         self.transform     = transform
@@ -177,7 +185,7 @@ class BaseDataset(object):
         self.log           = log
         self._indices      = None
         self._files        = dict()
-        self._data_reader  = BaseDataReader()
+        self._data_reader  = reader
         
         if self.log:
             print('Processing...', file=sys.stderr)
@@ -190,10 +198,9 @@ class BaseDataset(object):
         with open(osp.join(self.root, 'metadata.json'), "r") as jsonfile:
             metadata_dict = json.load(jsonfile)
         
-        self._indexing_system = BaseIndexingSystem(metadata_dict, sample_metadata, self.seed, **kwargs)
+        self._indexing_system = BaseIndexingSystem(metadata_dict, sample_metadata, self._seed, **kwargs)
         
-    
-    def len(self):
+    def __len__(self):
         """Returns length of dataset i.e. numberr of graphs in dataset"""
         return int(self._indexing_system.num_available_data)
     
@@ -207,6 +214,12 @@ class BaseDataset(object):
         """
         raise NotImplementedError("This is an abstract class")
     
+    def __getitem__(self, idx):
+        data = self.get(idx)
+        if self.transform is not None:
+            data = self.transform(data)
+        return data
+
     @property
     def num_node_features(self) -> int:
         r"""Returns the number of features per node in the dataset."""
@@ -237,33 +250,41 @@ class BaseDataset(object):
         
         raise AttributeError(f"'{data.__class__.__name__}' object has no "
                              f"attribute 'features'")
-    
+
 
 class BaseDataloader(object):
-    def __init__(self, dataset, seed=42, cache_dir=None,
-            test_precentage=10, validation_precentage=10,
+    def __init__(self, dataset, seed=42, cache_dir=None, disable_progress_bar=False,
+            test_precentage=10, validation_precentage=10, process=False,
             batch_size=64, num_workers=4, shuffle=False, pin_memory=False, **kwargs
             ) -> None:
+        self._process = process
+        self._prog = disable_progress_bar
         self._seed = seed
         self._root = cache_dir
-        self._batch_size  = dataloader_args['batch_size']
+        self._batch_size  = batch_size
         self._dataset     = dataset
-        self.process(len(dataset), 10, 10, batch_size=64, num_workers=4, shuffle=False, pin_memory=False, **kwargs)
-        # Contexmanager vars:
+        self._num_workers = num_workers
+        self.process(
+            dataset_length=len(dataset),
+            test_percentage=test_precentage,
+            validation_percentage=validation_precentage,
+            batch_size=batch_size, num_workers=num_workers, shuffle=shuffle, pin_memory=pin_memory, **kwargs
+            )
+        # Context vars:
         self._open = False
         self._context_loader   = None
         self._context_dir      = None
         self._context_metadata = None
         self._context_device   = None
         
-    def process(self, dataset_length, test_percentage, validation_percentage, **dataloader_args):
+    def process(self, dataset_length, test_percentage, validation_percentage, **kwargs):
         random.seed(self._seed)
         torch.manual_seed(self._seed)
 
-        self._validation_len = (dataset_length * test_percentage) // 100 
-        self._test_len       = (dataset_length * validation_percentage) // 100
+        self._validation_len = (dataset_length * validation_percentage) // 100 
+        self._test_len       = (dataset_length * test_percentage) // 100
         self._train_len      = dataset_length - self._validation_len - self._test_len
-        self._len = {
+        self._num = {
             'test': self.test_len, 
             'validation': self.validation_len,
             'train': self.train_len
@@ -273,20 +294,36 @@ class BaseDataloader(object):
                 self._dataset, lengths=[self._train_len, self._validation_len, self._test_len]
             )
         # Generators
-        self._train_gen       = pyg_dataloader(train_subset, **dataloader_args)
-        self._validation_gen  = pyg_dataloader(valid_subset, **dataloader_args)
-        self._test_gen        = pyg_dataloader(test_subset,  **dataloader_args)
+        self._train_gen       = pyg_dataloader(train_subset, **kwargs)
+        self._validation_gen  = pyg_dataloader(valid_subset, **kwargs)
+        self._test_gen        = pyg_dataloader(test_subset,  **kwargs)
+        self._len = {
+            'test': len(self._test_gen), 
+            'validation': len(self._validation_gen),
+            'train': len(self._train_gen)
+        }
         self._loader_metadata = dict()
-
-    def __enter__(self, subset, device='cuda:0'):
+    
+    def __call__(self, subset, device='cuda:0'):
         assert subset in ['test', 'train', 'validation'], f"{subset} is unknown. Use one of 'test', 'train', 'validation'."
-        self._open = True
         self._context_loader   = subset
         self._context_device   = device
         self._context_dir      = osp.join(self._root, subset)
         self._context_metadata = self._loader_metadata[subset]
-        yield iter(self)
+        return self
     
+
+    def __enter__(self):
+        self._open = True
+        return iter(self)
+    
+    def __exit__(self, *args):
+        self._open = False
+        self._context_loader   = None
+        self._context_dir      = None
+        self._context_metadata = None
+        self._context_device   = None
+        
     @property
     def test_len(self):
         return self._test_len
@@ -299,19 +336,24 @@ class BaseDataloader(object):
     def validation_len(self):
         return self._validation_len
 
-    def total(self):
-        if self._open:
-            return self._len[self._context_loader]
-        return len(self._dataset)
+    @property
+    def numbers(self):
+        return self._num
 
-    def __len__(self):
-        if self._open:
-            return len(self._loader_metadata[self.self._context_loader])
-        raise AssertionError
+    @property
+    def lengths(self):
+        return self._len
 
-    def __exit__(self):
-        self._open = False
+    def len(self):
+        return self.lengths[self._context_loader]
 
+    def num(self):
+        return self.numbers[self._context_loader]
+ 
+    def describe(self):
+        print(f'dataloader is open at {self._context_loader}')
+        print(f'at deirectory: {self._context_dir}')
+        
     def __iter__(self):
         if not self._open:
             raise RuntimeError("Iteration only availabele when you open the dataloader")
@@ -329,25 +371,31 @@ class BaseTrainer(object):
         self._optimizer    = None
         self._loss_func    = None
         self._lr_scheduler = None
+        self._open = False
 
-        self._models_dir   = os.path.join(self._root, 'models')
+        if not osp.isdir(self._root):
+            os.mkdir(self._root)
+
+        self._models_dir   = osp.join(self._root, 'models')
         ind = 0
         while osp.isdir(self._models_dir):
             ind += 1
-            self._models_dir = os.path.join(self._root, f'models({ind})')
-        os.mkdir(self._models_directory)
+            self._models_dir = osp.join(self._root, f'models({ind})')
+        os.mkdir(self._models_dir)
     
-    def __enter__(self, model, device='cuda:0', disable_progress_bar=False):
-        self._prog   = disable_progress_bar
-        self._moder  = model
-        self._device = device
-        self._prog   = disable_progress_bar
+    def __enter__(self):
+        self._open = True
         return self
-
-    @property
-    def dataloader(self):
-        return self._loader
     
+    def set(self, model, device='cuda:0', disable_progress_bar=False):
+        self._model = model
+        self._device = device
+        self._prog  = disable_progress_bar
+        return self
+    
+    def __exit__(self, *args):
+        self._open = False
+ 
     @property
     def dataloader(self):
         return self._loader
@@ -368,14 +416,38 @@ class BaseTrainer(object):
 
     def evaluate(self, *args, **kwargs):
         raise NotImplementedError
-        
+    
+    def _process_state_dict(self, state_dict):
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            name = k.replace("module.", "")
+            new_state_dict[name] = v
+        return new_state_dict
+
+    def _bestk_models(self, valid_loss, k):
+        args = np.argpartition(valid_loss,k-1)[:k]
+        max_epochs = len(valid_loss) + 1
+        kbest_model_dir = [
+            osp.join(self._models_dir, f"epoch-{best_model_ind + 1:0{len(str(max_epochs))}d}.pt")
+            for best_model_ind in args
+        ]
+        kbest_model_dir_new = [
+            osp.join(self._models_dir, f"epoch-{best_model_ind + 1:0{len(str(max_epochs))}d}(best).pt")
+            for best_model_ind in args
+        ]
+        for dir, new_dir in zip(kbest_model_dir, kbest_model_dir_new):
+            os.rename(dir, new_dir)
+
+        return [torch.load(path) for path in kbest_model_dir_new]
+
     def train(self, max_epochs, optimizer, optimizer_args,
                                 loss_fn, loss_fn_args=dict(),
                                 lr_scheduler=None, lr_scheduler_args=dict(),
-                                use_benchmark=True, metrics=[], select_topk=5, **kwargs):
+                                use_benchmark=True, metrics=[], select_topk=5, set_device=True, **kwargs):
             
         print("Training device {}...\n".format(self._device))
-        self._model        = self._model.to(self._device)
+        if set_device:
+            self._model        = self._model.to(self._device)
         self._loss_func    = loss_fn(**loss_fn_args)
         self._optimizer    = optimizer(self._model.parameters(), **optimizer_args)
         self._lr_scheduler = lr_scheduler(self._optimizer, **lr_scheduler_args) if lr_scheduler is not None else None
@@ -384,111 +456,72 @@ class BaseTrainer(object):
         is_failed = False
         torch.backends.cudnn.benchmark = use_benchmark
         summary = namedtuple('TrainingSummary', ['failing_status', 'res'])
-        for epoch in trange(max_epochs, desc=f'Training the {self._name}...', unit='Epoch', ncols=950, disable=self._prog):
-            torch.cuda.empty_cache()
-            is_failed, res = self.train_one_epoch(epoch, grad_clipping_number)
-            if is_failed:
-                print(res[0], file=sys.stderr)
-                return summary(is_failed, res)
-            
-            is_failed, res = self.evaluate("train", metrics)
-            if is_failed:
-                print(res[0], file=sys.stderr)
-                return summary(is_failed, res)
-            
-            train_loss_arr[epoch] = res
-            
-            is_failed, res = self.evaluate('validation', metrics)
-            if is_failed:
-                print(res[0], file=sys.stderr)
-                return summary(is_failed, res)
-            
-            valid_loss_arr[epoch] = res
-            
-            
-            path_to_model = os.path.join(self._models_directory, f"epoch-{epoch + 1:0{len(str(max_epochs))}d}.pt")
-            torch.save(self._model.state_dict(), path_to_model)
-                        
-            print(f'Training Set Loss: {train_loss_arr[epoch]:.4f}, Validation Set Loss: {valid_loss_arr[epoch]:.4f}\n')
-            
-            if self._lr_scheduler is not None:
-                self._lr_scheduler.step()
+        with tqdm(total=max_epochs, desc='Training ...', unit='Epoch', disable=self._prog) as pbar:
+            for epoch in range(max_epochs):
+                torch.cuda.empty_cache()
+                is_failed, res = self.train_one_epoch(epoch)
+                if is_failed:
+                    print(res[0], file=sys.stderr)
+                    return summary(is_failed, res)
+                
+                is_failed, res = self.evaluate("train", metrics)
+                if is_failed:
+                    print(res[0], file=sys.stderr)
+                    return summary(is_failed, res)
+                
+                train_loss_arr[epoch] = res
+                
+                is_failed, res = self.evaluate('validation', metrics)
+                if is_failed:
+                    print(res[0], file=sys.stderr)
+                    return summary(is_failed, res)
+                
+                valid_loss_arr[epoch] = res
+                
+                
+                path_to_model = osp.join(self._models_dir, f"epoch-{epoch + 1:0{len(str(max_epochs))}d}.pt")
+                torch.save(self._model.state_dict(), path_to_model)
+                            
+                print(f'Training Set Loss: {train_loss_arr[epoch]}, Validation Set Loss: {valid_loss_arr[epoch]}\n')
+                
+                if self._lr_scheduler is not None:
+                    self._lr_scheduler.step()
+                
+                pbar.update(1)
 
-        self._model = self._model.to('cpu')
-
-        if save_models:
-            kbest_model_ind = np.argmin(valid_loss_arr, )
-            kbest_model_dir = os.path.join(self._models_directory, f"epoch-{best_model_ind + 1:0{len(str(max_epochs))}d}.pt")
-            kbest_model_new_dir = os.path.join(self._models_directory, f"epoch-{best_model_ind + 1:0{len(str(max_epochs))}d}(best).pt")
-            os.rename(best_model_dir, best_model_new_dir)
-            self._model.load_state_dict(torch.load(best_model_dir))
-
+        
         fig = go.Figure(
                 data = [
-                    go.Scatter(x=list(range(1, max_epochs + 1)), y=train_loss_arr, name='Training Set'),
-                    go.Scatter(x=list(range(1, max_epochs + 1)), y=valid_loss_arr, name='Validation Set'),
+                    go.Scatter(x=list(range(1, max_epochs + 1)), y=train_loss_arr[:,0], name=f'Training Set'),
+                    go.Scatter(x=list(range(1, max_epochs + 1)), y=valid_loss_arr[:,0], name=f'Validation Set')
                 ]
-        )
-
+            )
         fig.update_layout(title="Training Summary")
         fig.update_xaxes(title="Epoch")
         fig.update_yaxes(title=str(self._loss_func)[:-2])
+        plotly.io.write_html(fig,  osp.join(self._root, f'Training objective {str(self._loss_func)[:-2]}.html'))
+        plotly.io.write_json(fig,  osp.join(self._root, f'Training objective {str(self._loss_func)[:-2]}.json'))
+        for i in range(len(metrics)):
+            fig = go.Figure(
+                    data = [
+                        go.Scatter(x=list(range(1, max_epochs + 1)), y=train_loss_arr[:,i+1], name=f'Training Set'),
+                        go.Scatter(x=list(range(1, max_epochs + 1)), y=valid_loss_arr[:,i+1], name=f'Validation Set')
+                    ]
+            )
+
+            fig.update_layout(title="Training Summary")
+            fig.update_xaxes(title="Epoch")
+            fig.update_yaxes(title=str(metrics[i])[:-2])
         
-        plotly.io.write_html(fig,  os.path.join(self._root, 'Training Summary.html'))
-        plotly.io.write_json(fig,  os.path.join(self._root, 'Training Summary.json'))
+            plotly.io.write_html(fig,  osp.join(self._root, f'Training metric {str(metrics[i])[:-2]}.html'))
+            plotly.io.write_json(fig,  osp.join(self._root, f'Training metric {str(metrics[i])[:-2]}.json'))
         
         summary = namedtuple('TrainingSummary', 
             ['failing_status', 'training_set_loss', 'validation_set_loss', 'plot', 'models']
         )        
-        
-        return summary(is_failed, train_loss_arr, valid_loss_arr, fig, self._bestk_models(valid_loss_arr, select_topk))
-    
-    
-class MultibatchPUGNNTrainer(PUGNNTrainer):
-    def __init__(self, num_batch=5, *args, **kwargs):
-        super(MultibatchPUGNNTrainer, self).__init__(*args, **kwargs)
-        self._n = num_batch
-        
-    def train_one_epoch(self, epoch=-1, clip=None):
-        self._model.train()  
-        b_ind = -1
-        data_list = []
-        last_ind = self._train_len - 1
-        
-        for data in tqdm(self._train_gen, desc=f"Epoch {epoch+1:03d}", unit="Batch", disable=self._prog):
-            b_ind += 1
-            is_last = b_ind == last_ind
-            
-            clean, err = self.check_data(data, b_ind)
-            
-            if not clean:
-                print(err, file=sys.stderr)
-                continue
-                
-            if (b_ind % self._n == self._n - 1) or is_last:
-                data_list.append(data)
-                out    = self._model(data_list)    # Perform a single forward pass.
-                target = torch.cat([d.y for d in data_list])
-                loss   = self._loss_func(out, target.unsqueeze(1))                           # Compute the loss.
+        self._model
+        return summary(is_failed, train_loss_arr, valid_loss_arr, fig, self._bestk_models(valid_loss_arr[:, 0], select_topk))  
 
-                if np.isnan(loss.item()):
-                    w = "nan loss detected. Perhaps there is a divergance. Stopping the training..."
-                    return 1, (w, data)
-                
-                loss.backward()  # Derive gradients.
-                if clip is not None:
-                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), clip)
-                self._optimizer.step()       # Update parameters based on gradients.
-                self._optimizer.zero_grad()  # Clear gradients.
-                
-                del data_list
-                data_list = []
-            
-            else:
-                data_list.append(data)
-            
-        return 0, None
-    
         
 class BaseAnalyzer(object):
     def __init__(self, root, loader, seed=42):
@@ -501,23 +534,33 @@ class BaseAnalyzer(object):
         self._yhat   = None
         self._y      = None
         self._range  = None
+        self._open   = False
         self._output_dir = osp.join(root, 'analyzer')
 
+
         ind = 0
-        while osp.isdir(self._main_dir):
+        while osp.isdir(self._output_dir):
             ind += 1
             self._output_dir = osp.join(root, f'analyzer({ind})')
-        osp.mkdir(self._output_dir)
-
-        print("processing...")
-        self._process()
+        os.mkdir(self._output_dir)
     
-    def __enter__(self, models, metric, device='cuda:0'):
+    def __enter__(self):
+        self._open = True
+        return self
+    
+    def __exit__(self, *args):
+        self._open = False
+
+    def __call__(self, model, models, metric, device='cuda:0'):
+        if not self._open:
+            raise AssertionError
         self._metric = metric
+        self._model  = model
         self._models = models
         self._device = device
+        print("processing...", file=sys.stderr)
+        self.process(len(models))
         return self
-
 
     @property
     def yhat(self):
@@ -527,49 +570,68 @@ class BaseAnalyzer(object):
     def y(self):
         return self._y
 
-    def _loss(self, model, loader):
-        length   = len(loader)
+    def _loss(self, loader):
+        total  = loader.num()
+        length = loader.len()
         loss_arr = np.zeros(length)
-        total = loader.all_data()
         failed = False
         # Iterate in batches over the training/test/validation dataset.
-        for data in loader:
-            out = model(data)  
+        for b_ind, data in enumerate(loader):
+            out = self._model(data)  
             if out.cpu().detach().isnan().sum() > 0:
                 w = f"nan loss detected during evaluation. Perhaps there is a problem..."
                 failed = True
                 return failed, (w, data)
 
-            loss_arr[b_ind, ind] += metric(out, data.y).cpu().item() * len(data) / total
+            loss_arr[b_ind] += self._metric(out, data.y.unsqueeze(1)).cpu().item() * len(data) / total
             
-        return failed, loss_arr.sum(0)
+        return failed, loss_arr.sum()
 
     def process(self, num_models):
-        with torch.no_grad(), open(self._loader, 'test') as test_loader:
+        self._model = self._model.to(self._device)
+        self._model.eval()
+        with torch.no_grad(), self._loader('test', self._device) as test_loader:
             loss_values = []
-            for model in self._models:
-                model = model.to(self._device)
-                model.eval()
-                failed, loss = self._loss(test_loader, model)
+            for state_dict in self._models:
+                # TODO: Bug here from  `_Incompatible Keys`
+                self._model.load_state_dict(state_dict)
+                failed, loss = self._loss(test_loader)
                 if failed:
                     raise ValueError
                 loss_values.append(loss)
 
-            self._model = self._models[np.argmin(loss_values)]
+            self._model.load_state_dict(self._models[np.argmin(loss_values)])
             self._yhat = torch.tensor([], dtype=float)
             self._y    = torch.tensor([], dtype=float)
-
-            for data in tqdm(test_loader, desc='Evaluating...', unit='Batch', ncols=1000):
-                out  = self._model(data)
-                
-                self._yhat = torch.concat([self._yhat, out.cpu().detach()])
-                self._y = torch.concat([self._y, data.y.cpu().detach()])
+            with tqdm(total=test_loader.len(), desc='Evaluating...', unit='Batch') as pbar:
+                for data in test_loader:
+                    out  = self._model(data)
+                    
+                    self._yhat = torch.concat([self._yhat, out.cpu().detach()])
+                    self._y = torch.concat([self._y, data.y.cpu().detach()])
+                    pbar.update(1)
 
             self._yhat = self._yhat.squeeze().detach().numpy()
             self._y    = self._y.detach().numpy()
             
             self._range = np.arange(self._y.min(), self._y.max() + 2)
     
+    @property
+    def model(self):
+        return self._model
+        
+    def extract_feature(self, ind, num_features):
+        feature_tensor = torch.tensor([], dtype=float).cuda()
+        with torch.no_grad(), self._loader('test', self._device) as test_loader:
+            with tqdm(total=test_loader.len(), desc='Extracting...', unit='Batch') as pbar:
+                for data in test_loader:
+                    feature_tensor = torch.concat([feature_tensor, torch.reshape(data.features, (-1, num_features))[:,ind]])
+                    pbar.update(1)
+        return feature_tensor.cpu().detach().numpy()
+
+    def apply_metrics(self, metrics=[]):
+        return [metric(self.yhat, self.y) for metric in metrics]
+
     def histogram(self):
         fig_hist = go.Figure()
         fig_hist.add_trace(go.Histogram(x=self._y, name='PU'))
@@ -577,8 +639,8 @@ class BaseAnalyzer(object):
         fig_hist.update_xaxes(title="PU")
         fig_hist.update_yaxes(title="Count")
         fig_hist.update_layout(title="Histogram of PU and estimated PU")
-        plotly.io.write_json(fig_hist,  os.path.join(self._output_dir, 'histogram.json'))
-        plotly.io.write_html(fig_hist,  os.path.join(self._output_dir, 'histogram.html'))
+        plotly.io.write_json(fig_hist,  osp.join(self._output_dir, 'histogram.json'))
+        plotly.io.write_html(fig_hist,  osp.join(self._output_dir, 'histogram.html'))
         return fig_hist
     
     def kde_plot(self):
@@ -635,17 +697,18 @@ class BaseAnalyzer(object):
         fig_kde.update_xaxes(title="PU")
         fig_kde.update_yaxes(title="Estimated PU")
         fig_kde.update_layout(title="KDE Plot of PU and Estimated PU")
-        plotly.io.write_html(fig_kde,   os.path.join(self._output_dir, 'kdeplot.html'))
-        plotly.io.write_json(fig_kde,   os.path.join(self._output_dir, 'kdeplot.json'))
+        plotly.io.write_html(fig_kde,   osp.join(self._output_dir, 'kdeplot.html'))
+        plotly.io.write_json(fig_kde,   osp.join(self._output_dir, 'kdeplot.json'))
+        return fig_kde
 
     def heatmap(self):
-        fig_hm = self.heatmap()
         fig_hm = go.Figure(go.Histogram2d(x=self._y, y=self._yhat))
         fig_hm.update_xaxes(title="PU")
         fig_hm.update_yaxes(title="Estimated PU")
         fig_hm.update_layout(title="2D histogrma of PU and Estimated PU")
-        plotly.io.write_html(fig_hm,    os.path.join(self._output_dir, 'heatmap.html'))
-        plotly.io.write_json(fig_hm,    os.path.join(self._output_dir, 'heatmap.json'))
+        plotly.io.write_html(fig_hm,    osp.join(self._output_dir, 'heatmap.html'))
+        plotly.io.write_json(fig_hm,    osp.join(self._output_dir, 'heatmap.json'))
+        return fig_hm
 
     def distribution_plots(self):
         s = namedtuple("DistPlots", ["heatmap", "histogram", 'kdeplot'])
@@ -657,8 +720,8 @@ class BaseAnalyzer(object):
         fig.update_yaxes(title='Residuals')
         fig.update_xaxes(title='Estimated PU')
         fig.update_layout(title="Residual Plot")
-        plotly.io.write_html(fig,  os.path.join(self._output_dir, 'residual-plot.html'))
-        plotly.io.write_json(fig,  os.path.join(self._output_dir, 'residual-plot.json'))
+        plotly.io.write_html(fig,  osp.join(self._output_dir, 'residual-plot.html'))
+        plotly.io.write_json(fig,  osp.join(self._output_dir, 'residual-plot.json'))
         return fig
     
     def compare(self, **outputs):
@@ -678,10 +741,8 @@ class BaseAnalyzer(object):
         fig.update_xaxes(title='No. PU')
         fig.update_layout(title='Comparing')
         
-        plotly.io.write_html(fig,  os.path.join(self._output_dir, 'compare-models-plot.html'))
-        plotly.io.write_json(fig,  os.path.join(self._output_dir, 'compare-models-plot.json'))
+        plotly.io.write_html(fig,  osp.join(self._output_dir, 'compare-models-plot.html'))
+        plotly.io.write_json(fig,  osp.join(self._output_dir, 'compare-models-plot.json'))
         
         s = namedtuple('Comparing', ['plot', 'R2'])
         return s(fig, r_squared_array)
-    
-    

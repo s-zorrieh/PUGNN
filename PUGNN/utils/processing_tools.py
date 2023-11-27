@@ -4,21 +4,34 @@ from torch_geometric import utils
 from torch_sparse import SparseTensor
 import torch_geometric as pyg
 import numpy as np
+import h5py
 import sys
 
 
-def get_data(file_name, group, index, wait=10, trials=60):
+def get_batch(file, wait=10, trials=60):
     while trials > 0:
         try:
-            with h5py.open(file_name, 'r') as file:
-                return True, file_name[group][index][0]
+            return False, torch.load(file)
             
         except FileNotFoundError as e:
             trials -= 1
             print(e, file=sys.stderr)
             print(f"waiting for {wait} sec...", file=sys.stderr)
             time.sleep(wait)
-    return False, "The directory is not reachable..."
+        return True, "The directory is not reachable..."
+
+def get_data(file_name, group, index, wait=10, trials=60):
+    while trials > 0:
+        try:
+            with h5py.File(file_name, 'r') as file:
+                return False, file[group][index][0]
+            
+        except FileNotFoundError as e:
+            trials -= 1
+            print(e, file=sys.stderr)
+            print(f"waiting for {wait} sec...", file=sys.stderr)
+            time.sleep(wait)
+    return True, "The directory is not reachable..."
 
 
 def to_heterodata(nodes:dict, edges:dict, weights:dict, features, labels):
@@ -77,16 +90,19 @@ def to_heterodata(nodes:dict, edges:dict, weights:dict, features, labels):
     return hdata
 
 
-def to_data(x, edges, weights, features, labels):
+def to_data(x, edges, weights, features, labels, momentum_con=False):
     x, features = extend_features(torch.from_numpy(x), features[0][0])
-    weights = torch.pow(torch.sigmoid(torch.from_numpy(weights)), -1)
-    edges, weights = utils.to_undirected(torch.tensor(edges), weights)
-    edges, weights = utils.add_self_loops(edges, weights, 2)
+
+    if momentum_con:
+        edges, weights = momentum_connection(x[:,1])
+    else:
+        weights = torch.pow(torch.sigmoid(torch.from_numpy(weights)), -1)
+        edges, weights = utils.to_undirected(torch.from_numpy(edges), weights)
+        edges, weights = utils.add_self_loops(edges, weights, 2)
     n = len(x)
     adj = SparseTensor(row=edges[0], col=edges[1], value=weights, sparse_sizes=(n, n))
     x = torch.cat([x, (adj.to_torch_sparse_coo_tensor() @ x[:,1]).unsqueeze(1)], dim=1)
     return pyg.data.Data(x=x, features=features, adj_t=adj, y=torch.from_numpy(labels))
-
 
 def extend_features(x, nv):
     graph_features = [nv]
@@ -151,7 +167,10 @@ def remove_nan_node(node_features, edge_index, edge_attributes):
     for node in node_ID:
         _, edge    = np.where(edge_index == node)
         edge_index = np.delete(edge_index, edge, axis=1)
-        edge_attributes = np.delete(edge_attributes, edge, axis=0)
+        mask = edge_index > node
+        if mask.sum() > 0:
+            edge_index[mask] = edge_index[mask] - 1
+        edge_attributes  = np.delete(edge_attributes, edge, axis=0)
     
     return node_features, edge_index, edge_attributes
 
@@ -162,6 +181,9 @@ def remove_inf_node(node_features, edge_index, edge_attributes):
     for node in node_ID:
         _, edge    = np.where(edge_index == node)
         edge_index = np.delete(edge_index, edge, axis=1)
+        mask = edge_index > node
+        if mask.sum() > 0:
+            edge_index[mask] = edge_index[mask] - 1
         edge_attributes = np.delete(edge_attributes, edge, axis=0)
     
     return node_features, edge_index, edge_attributes
