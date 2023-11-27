@@ -51,7 +51,7 @@ def check_and_summarize(directory, to='./', rewrite=True, log=True):
 
     # summary
     if rewrite:
-        with open(os.path.join(to, 'summary.json'), "w") as outfile:
+        with open(os.path.join(to, 'metadata.json'), "w") as outfile:
                 outfile.write(json.dumps(summary, indent=4))
     return nfiles
 

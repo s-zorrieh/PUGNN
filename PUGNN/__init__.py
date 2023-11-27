@@ -1,5 +1,6 @@
 from .base import BaseDataReader, BaseDataset, BaseDataloader, BaseTrainer, BaseAnalyzer
-from .utils.processing_tools import get_data, to_data, check_and_summarize
+from .utils.processing_tools import get_data, to_data
+from .utils.preprocessing_tools import check_and_summarize
 import numpy as np
 import datetime 
 import sys
@@ -46,7 +47,7 @@ class HeteroDataReader(BaseDataReader):
 class HomoDataset(BaseDataset):
     def get(self, idx):
         filename, PU, infile_index = self._indexing_system._get_item(self, idx)
-        path_to_file = osp.join(self.root, filename + ".h5")
+        path_to_file = osp.join(self._in_dir, filename + ".h5")
         data = self._data_reader(path_to_file, f"PU{PU}", f"E{infile_index}")
 
 
@@ -61,6 +62,7 @@ class DataLoader(BaseDataloader):
         if not self._open:
             raise RuntimeError("Iteration only availabele when you open the dataloader")
         yield iter(self._context_metadata[self._context_loader])
+
 
 class BoostedDataLoader(BaseDataloader):
     def process(self, dataset_length, dataset_args, dataloader_args):
@@ -209,20 +211,26 @@ class Analyzer(BaseAnalyzer):
         return s(fig, act_arr, mle_arr, left_err_arr, right_err_arr)
 
 class SW(object):
-    def __init__(self, root, name) -> None:
+    def __init__(self, root, input_dir, name) -> None:
         self._time = str(datetime.datetime.now(pytz.timezone('Asia/Tehran'))).split('.')[0].replace(' ', '@')
         self._root = root
         self._name = name
-        self._metadata_dir = osp.join(self._main_dir, 'metadata')
-        self._output_dir   = osp.join(self._main_dir, f'out-{self._time}')
-        self._cache_dir    = osp.join(self._main_dir, f'cache-{self._time}')    
+        self._in_dir       = input_dir
         self._main_dir     = osp.join(root, f'{name}-pugnnsw')
+        self._cache_dir    = osp.join(self._main_dir, f'cache-{self._time}')    
+        self._output_dir   = osp.join(self._main_dir, f'out-{self._time}')
+        self._metadata_dir = osp.join(self._main_dir, 'metadata')
+
         if not os.path.isdir(self._main_dir):
             os.mkdir(self._main_dir)
+
         if not os.path.isdir(self._metadata_dir):
             os.mkdir(self._metadata_dir)
+
         if not os.path.isdir(self._output_dir):
             os.mkdir(self._output_dir)
+
+        check_and_summarize(self._in_dir, self._metadata_dir)
     
     @property
     def root(self):
@@ -244,8 +252,8 @@ class SW(object):
     def loader(self):
         return self._loader
     
-    def set_dataset(self, Dataset, DataReader, sample_metadata, data_reader, **kwargs) -> None:
-        self._dataset = Dataset(root, sample_metadata, self._seed, data_reader, **kwargs)
+    def set_dataset(self, Dataset, sample_metadata, data_reader, **kwargs) -> None:
+        self._dataset = Dataset(self._metadata_dir, self._in_dir, sample_metadata, self._seed, data_reader, **kwargs)
 
     def set_loader(self, DataLoaderClass, **kwargs):
         self._loader = DataLoaderClasss(self.dataset, self._seed, self._cache_dir, **kwargs)

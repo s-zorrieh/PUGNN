@@ -1,8 +1,9 @@
+from .utils.preprocessing_tools import get_index, check_and_summarize
+from .utils.processing_tools import remove_inf_node, remove_nan_node
 import sys
 import numpy as np
 from numpy import random
-from .utils.preprocessing_tools import get_index, check_and_summarize
-from .utils.processing_tools import remove_inf_node, remove_nan_node
+import torch
 from torch_geometric.loader import DataLoader as pyg_dataloader
 from copy import deepcopy
 import os.path as osp
@@ -162,13 +163,13 @@ class BaseDataReader(object):
         
 
 class BaseDataset(object):
-    def __init__(self, root, sample_metadata, reader, seed=42,
+    def __init__(self, root, in_dir, sample_metadata, reader, seed=42,
                  sampling_strategy={"replace":False, "p":None},
                  transform=None, pre_transform=None, pre_filter=None, log=False):
         
         if isinstance(root, str):
             root = osp.expanduser(osp.normpath(root))
-        
+        self._in_dir       = in_dir
         self.root          = root
         self.transform     = transform
         self.pre_transform = pre_transform
@@ -186,7 +187,7 @@ class BaseDataset(object):
                 
     def process(self, sample_metadata, **kwargs):
         """Process if you need"""
-        with open(osp.join(root, 'metadata'), "r") as jsonfile:
+        with open(osp.join(self.root, 'metadata.json'), "r") as jsonfile:
             metadata_dict = json.load(jsonfile)
         
         self._indexing_system = BaseIndexingSystem(metadata_dict, sample_metadata, self.seed, **kwargs)
