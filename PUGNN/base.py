@@ -517,7 +517,7 @@ class BaseTrainer(object):
             plotly.io.write_json(fig,  osp.join(self._root, f'Training metric {str(metrics[i])[:-2]}.json'))
         
         summary = namedtuple('TrainingSummary', 
-            ['failing_status', 'training_set_loss', 'validation_set_loss', 'plot', 'models']
+            ['failing_status', 'training_set_loss', 'validation_set_loss', 'plots', 'models']
         )        
         self._model
         return summary(is_failed, train_loss_arr, valid_loss_arr, fig, self._bestk_models(valid_loss_arr[:, 0], select_topk))  
