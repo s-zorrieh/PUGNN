@@ -70,14 +70,18 @@ class HomoDataset(BaseDataset):
 class DataLoader(BaseDataloader):
     def process(self, dataset_length, test_percentage, validation_percentage, **dataloader_args):
         super().process(dataset_length, test_percentage, validation_percentage, **dataloader_args)
-        self._context_metadata = dict(
+        self._loader_metadata = dict(
             zip(['test', 'train', 'validation'], [self._test_gen, self._train_gen, self._validation_gen])
             )
 
     def __iter__(self):
         if not self._open:
             raise RuntimeError("Iteration only availabele when you open the dataloader")
-        yield iter(self._context_metadata[self._context_loader])
+        self._iterator = iter(self._loader_metadata[self._context_loader])
+        return self
+    
+    def __next__(self):
+        return next(self._iterator).to(self._context_device)
 
 
 class _BatchDataset(Dataset):
